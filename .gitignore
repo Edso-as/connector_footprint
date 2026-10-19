@@ -16,3 +16,7 @@ wiz_test.*
 Thumbs.db
 .DS_Store
 out/
+
+build/
+dist/
+*.spec
