@@ -1,0 +1,17 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Generated / temporary outputs
+overlay.png
+dbg.png
+crop.png
+p[0-9].png
+wiz_test.*
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
