@@ -62,7 +62,27 @@ def hatch_ratio(img, b):
     return float(mag[diag].sum() / (mag.sum() + 1e-6))
 
 
-def pad_candidates(closed, dpi, img, relaxed=False):
+def hatch_candidates(img, dpi):
+    """Oval pads found from their 45-degree hatching, so labels/dimension lines touching a pad don't hide it."""
+    g = (cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) < 140).astype(np.uint8) * 255
+    L = max(9, int(0.0125 * dpi))
+    acc = np.zeros_like(g)
+    for flip in (False, True):
+        k = np.eye(L, dtype=np.uint8)
+        acc |= cv2.morphologyEx(g, cv2.MORPH_OPEN, k[::-1] if flip else k)
+    s = max(3, int(0.02 * dpi))
+    acc = cv2.morphologyEx(cv2.dilate(acc, np.ones((3, 3), np.uint8)), cv2.MORPH_CLOSE,
+                           cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (s, s)))
+    cnts, _ = cv2.findContours(acc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        if 0.04 * dpi < w < 0.5 * dpi and 0.06 * dpi < h < dpi and 0.3 < w / h < 0.9:
+            out.append((x, y, w, h))
+    return out
+
+
+def pad_candidates(closed, dpi, img, relaxed=False, hatch=True):
     """Hatched oval pad outlines. relaxed=True also accepts hollow ovals (low fill) with weaker hatching."""
     lo, hi = 0.04 * dpi, 0.5 * dpi
     fmin, hmin = (0.25, 0.30) if relaxed else (0.6, 0.35)
@@ -74,7 +94,7 @@ def pad_candidates(closed, dpi, img, relaxed=False):
             continue
         if fmin < cv2.contourArea(c) / (w * h) < 0.95 and hatch_ratio(img, (x, y, w, h)) > hmin:
             out.append((x, y, w, h))
-    return out
+    return out + hatch_candidates(img, dpi) if hatch else out
 
 
 def group_similar(boxes, tol=0.15):
@@ -89,19 +109,19 @@ def group_similar(boxes, tol=0.15):
     return groups
 
 
-def best_cluster(cands):
+def best_cluster(cands, s=1, min_n=3):
     """Most column-aligned compact cluster of >=3 distinct similar candidates (text/knurls rarely align)."""
     best, best_score = None, 0
     for g in group_similar(cands):
         for seed in g:
-            nb = [c for c in g if abs(c[0] - seed[0]) < 100 and abs(c[1] - seed[1]) < 100]
+            nb = [c for c in g if abs(c[0] - seed[0]) < 100 * s and abs(c[1] - seed[1]) < 100 * s]
             distinct = []  # fragments of one pad count once
             for c in nb:
-                if not any(abs(c[0] - d[0]) < 8 and abs(c[1] - d[1]) < 8 for d in distinct):
+                if not any(abs(c[0] - d[0]) < 8 * s and abs(c[1] - d[1]) < 8 * s for d in distinct):
                     distinct.append(c)
-            aligned = sum(1 for d in distinct if any(e is not d and abs(e[0] - d[0]) < 8 for e in distinct))
+            aligned = sum(1 for d in distinct if any(e is not d and abs(e[0] - d[0]) < 4 * s for e in distinct))
             score = aligned + 0.01 * len(distinct)
-            if len(distinct) >= 3 and aligned >= 2 and score > best_score:
+            if len(distinct) >= min_n and aligned >= min_n - 1 and score > best_score:
                 best, best_score = nb, score
     return best
 
@@ -110,7 +130,7 @@ def find_region(page):
     """Region (PDF points) around the best compact group of similar oval pads (strict, then relaxed)."""
     dpi, k = 1200, 72 / 1200
     tw, th, ov = 200, 150, 25
-    cands = {False: [], True: []}
+    cands = ([], [])  # contour-based pads first, hatch-only candidates as fallback
     y = page.rect.y0
     while y < page.rect.y1:
         x = page.rect.x0
@@ -119,14 +139,14 @@ def find_region(page):
             pix = page.get_pixmap(dpi=dpi, clip=clip)
             img = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
             closed = preprocess(img, dpi)
-            for relaxed in (False, True):
-                for bx, by, bw, bh in pad_candidates(closed, dpi, img, relaxed):
+            for kind, found in ((0, pad_candidates(closed, dpi, img, True, False)), (1, hatch_candidates(img, dpi))):
+                for bx, by, bw, bh in found:
                     c = (clip.x0 + (bx + bw / 2) * k, clip.y0 + (by + bh / 2) * k, bw * k, bh * k)
-                    if not any(abs(c[0] - o[0]) < 2 and abs(c[1] - o[1]) < 2 for o in cands[relaxed]):
-                        cands[relaxed].append(c)
+                    if not any(abs(c[0] - o[0]) < 2 and abs(c[1] - o[1]) < 2 for o in cands[kind]):
+                        cands[kind].append(c)
             x += tw - ov
         y += th - ov
-    best = best_cluster(cands[True])
+    best = best_cluster(cands[0]) or best_cluster(cands[1])
     if not best:
         return None
     x0, y0 = min(c[0] - c[2] / 2 for c in best), min(c[1] - c[3] / 2 for c in best)
@@ -148,14 +168,9 @@ def refine(closed, dpi, cx, cy, w, h):
     return y_lo + (y0 + y1) / 2, cols.max() - cols.min() + 1, y1 - y0 + 1
 
 
-def detect(page, rect, out_dir):
-    img, dpi = render_crop(page, rect)
-    closed = preprocess(img, dpi)
-    groups = group_similar(pad_candidates(closed, dpi, img) or pad_candidates(closed, dpi, img, True))
-    if not groups:
-        sys.exit("No hatched oval pads found in the region. Use a tighter region or measure manually.")
-    g = max(groups, key=len)
-    x, y, w, h = max(g, key=lambda b: (closed[b[1]:b[1] + b[3], b[0]:b[0] + b[2]] > 0).mean())
+def match_pads(closed, img, dpi, seed):
+    """Template-match one seed box over the crop; returns pads (weak/non-column matches dropped)."""
+    x, y, w, h = seed
     score = cv2.matchTemplate(closed, closed[y:y + h, x:x + w], cv2.TM_CCOEFF_NORMED)
     found = []
     for _ in range(80):
@@ -168,10 +183,29 @@ def detect(page, rect, out_dir):
         if hatch_ratio(img, (loc[0], loc[1], w, h)) < 0.30:  # weak matches on plain lines/arrows
             continue
         found.append(dict(cx=float(cx), cy=float(cy), w=float(rw), h=float(rh), score=round(float(mx), 2)))
-    mw = float(np.median([p["w"] for p in found]))
     # weak matches (score<0.7) must line up in a column with a strong one; otherwise they are dimension ticks/arrows
-    found = [p for p in found if p["score"] >= 0.7 or any(
+    return [p for p in found if p["score"] >= 0.7 or any(
         q["score"] >= 0.7 and abs(q["cx"] - p["cx"]) < 0.25 * w for q in found)]
+
+
+def detect(page, rect, out_dir):
+    img, dpi = render_crop(page, rect)
+    closed = preprocess(img, dpi)
+    cands = pad_candidates(closed, dpi, img, True)
+    g = best_cluster(cands, dpi / 72) or best_cluster(cands, dpi / 72, 1) or cands[:1]
+    if not g:
+        sys.exit("No hatched oval pads found in the region. Use a tighter region or measure manually.")
+    pool = list(g) + [c for c in cands if c not in g]
+    best = None
+    for seed in pool[:12]:  # keep the seed whose template matches the most pads
+        f = match_pads(closed, img, dpi, seed)
+        key = (len(f), min((p["score"] for p in f), default=0))
+        if best is None or key > best[0]:
+            best = (key, seed, f)
+    _, (x, y, w, h), found = best
+    if not found:
+        sys.exit("No hatched oval pads found in the region. Use a tighter region or measure manually.")
+    mw = float(np.median([p["w"] for p in found]))
     for p in found:
         p["w"] = mw
     found.sort(key=lambda p: (round(p["cx"] / (w * 2)), p["cy"]))  # column, then top->bottom

@@ -56,7 +56,27 @@ def hatch_ratio(img, b):
     return float(mag[diag].sum() / (mag.sum() + 1e-6))
 
 
-def pad_candidates(closed, dpi, img):
+def hatch_candidates(img, dpi):
+    """Oval pads found from their 45-degree hatching, so labels/dimension lines touching a pad don't hide it."""
+    g = (cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) < 140).astype(np.uint8) * 255
+    L = max(9, int(0.0125 * dpi))
+    acc = np.zeros_like(g)
+    for flip in (False, True):
+        k = np.eye(L, dtype=np.uint8)
+        acc |= cv2.morphologyEx(g, cv2.MORPH_OPEN, k[::-1] if flip else k)
+    s = max(3, int(0.02 * dpi))
+    acc = cv2.morphologyEx(cv2.dilate(acc, np.ones((3, 3), np.uint8)), cv2.MORPH_CLOSE,
+                           cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (s, s)))
+    cnts, _ = cv2.findContours(acc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        if 0.04 * dpi < w < 0.5 * dpi and 0.06 * dpi < h < dpi and 0.3 < w / h < 0.9:
+            out.append((x, y, w, h))
+    return out
+
+
+def pad_candidates(closed, dpi, img, hatch=True):
     """Boxes that look like a hatched oval pad."""
     lo, hi = 0.04 * dpi, 0.5 * dpi
     cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
@@ -67,10 +87,10 @@ def pad_candidates(closed, dpi, img):
             continue
         if 0.25 < cv2.contourArea(c) / (w * h) < 0.95 and hatch_ratio(img, (x, y, w, h)) > 0.30:
             out.append((x, y, w, h))
-    return out
+    return out + hatch_candidates(img, dpi) if hatch else out
 
 
-def best_group(cands, min_n=3):
+def best_group(cands, min_n=3, s=1):
     """Most column-aligned cluster of >=3 distinct similar candidates (text/knurls rarely align)."""
     groups = []
     for b in cands:
@@ -83,12 +103,12 @@ def best_group(cands, min_n=3):
     best, best_score = None, 0
     for g in groups:
         for seed in g:
-            nb = [c for c in g if abs(c[0] - seed[0]) < 100 and abs(c[1] - seed[1]) < 100]
+            nb = [c for c in g if abs(c[0] - seed[0]) < 100 * s and abs(c[1] - seed[1]) < 100 * s]
             distinct = []  # fragments of one pad count once
             for c in nb:
-                if not any(abs(c[0] - d[0]) < 8 and abs(c[1] - d[1]) < 8 for d in distinct):
+                if not any(abs(c[0] - d[0]) < 8 * s and abs(c[1] - d[1]) < 8 * s for d in distinct):
                     distinct.append(c)
-            aligned = sum(1 for d in distinct if any(e is not d and abs(e[0] - d[0]) < 8 for e in distinct))
+            aligned = sum(1 for d in distinct if any(e is not d and abs(e[0] - d[0]) < 4 * s for e in distinct))
             score = aligned + 0.01 * len(distinct)
             if len(distinct) >= min_n and aligned >= min_n - 1 and score > best_score:
                 best, best_score = nb, score
@@ -104,7 +124,7 @@ def auto_find_layout(page):
             return pymupdf.Rect(r.x0 - 60, r.y0 - 190, r.x0 + 190, r.y1 + 25) & page.rect
     # Raster fallback: scan the page in 1200 dpi tiles for groups of similar oval pads
     dpi, k = 1200, 72 / 1200
-    cands = []
+    cands = ([], [])
     tw, th, ov = 200, 150, 25
     y = page.rect.y0
     while y < page.rect.y1:
@@ -113,13 +133,15 @@ def auto_find_layout(page):
             clip = pymupdf.Rect(x, y, x + tw, y + th) & page.rect
             pix = page.get_pixmap(dpi=dpi, clip=clip)
             img = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
-            for bx, by, bw, bh in pad_candidates(preprocess(img, dpi), dpi, img):
-                c = (clip.x0 + (bx + bw / 2) * k, clip.y0 + (by + bh / 2) * k, bw * k, bh * k)
-                if not any(abs(c[0] - o[0]) < 2 and abs(c[1] - o[1]) < 2 for o in cands):
-                    cands.append(c)
+            closed = preprocess(img, dpi)
+            for kind, found in ((0, pad_candidates(closed, dpi, img, False)), (1, hatch_candidates(img, dpi))):
+                for bx, by, bw, bh in found:
+                    c = (clip.x0 + (bx + bw / 2) * k, clip.y0 + (by + bh / 2) * k, bw * k, bh * k)
+                    if not any(abs(c[0] - o[0]) < 2 and abs(c[1] - o[1]) < 2 for o in cands[kind]):
+                        cands[kind].append(c)
             x += tw - ov
         y += th - ov
-    best = best_group(cands)
+    best = best_group(cands[0]) or best_group(cands[1])
     if not best:
         return None
     x0, y0 = min(c[0] - c[2] / 2 for c in best), min(c[1] - c[3] / 2 for c in best)
@@ -143,7 +165,7 @@ def refine(closed, dpi, cx, cy, w, h):
     return y_lo + (y0 + y1) / 2, cols.max() - cols.min() + 1, y1 - y0 + 1
 
 
-def detect_pads(closed, dpi, seed, count=0, min_score=0.5):
+def detect_pads(closed, dpi, seed, count=0, min_score=0.5, img=None):
     """Template-match the seed pad. count=0 -> as many as score >= min_score."""
     x, y, w, h = seed
     score = cv2.matchTemplate(closed, closed[y:y + h, x:x + w], cv2.TM_CCOEFF_NORMED)
@@ -154,8 +176,10 @@ def detect_pads(closed, dpi, seed, count=0, min_score=0.5):
             break
         cx = loc[0] + w / 2
         cy, rw, rh = refine(closed, dpi, cx, loc[1] + h / 2, w, h)
-        found.append(dict(cx=cx, cy=cy, w=rw, h=rh, score=float(mx), pin=None))
         cv2.rectangle(score, (loc[0] - w, loc[1] - h), (loc[0] + w, loc[1] + h), -1, -1)
+        if img is not None and hatch_ratio(img, (loc[0], loc[1], w, h)) < 0.30:  # plain lines/arrows
+            continue
+        found.append(dict(cx=cx, cy=cy, w=rw, h=rh, score=float(mx), pin=None))
     # weak matches (score<0.7) must line up in a column with a strong one; otherwise they are dimension ticks/arrows
     found = [p for p in found if p["score"] >= 0.7 or any(
         q["score"] >= 0.7 and abs(q["cx"] - p["cx"]) < 0.25 * w for q in found)]
@@ -166,12 +190,12 @@ def detect_pads(closed, dpi, seed, count=0, min_score=0.5):
     return found
 
 
-def pick_seed(closed, dpi, cands, group):
+def pick_seed(closed, dpi, cands, group, img=None):
     """Template seed = the candidate whose template matches the most pads (robust to touched/truncated pads)."""
     pool = list(group) + [c for c in cands if c not in group]
     best, best_key = pool[0], (-1, 0)
     for b in pool[:12]:
-        f = detect_pads(closed, dpi, b)
+        f = detect_pads(closed, dpi, b, img=img)
         key = (len(f), min((p["score"] for p in f), default=0))
         if key > best_key:
             best, best_key = b, key
@@ -483,13 +507,13 @@ class App(tk.Tk):
             self.crop_img, self.crop_dpi = render_crop(self.page, self.region)
             self.closed = preprocess(self.crop_img, self.crop_dpi)
             cands = pad_candidates(self.closed, self.crop_dpi, self.crop_img)
-            g = best_group(cands) or best_group(cands, 1) or (cands[:1] or None)
+            g = best_group(cands, s=self.crop_dpi / 72) or best_group(cands, 1, self.crop_dpi / 72) or (cands[:1] or None)
         finally:
             self.config(cursor="")
         if not g:
             self.msg.set("這個區域找不到焊盤,請重新框選。")
             return False
-        self.seed = pick_seed(self.closed, self.crop_dpi, cands, g)
+        self.seed = pick_seed(self.closed, self.crop_dpi, cands, g, self.crop_img)
         self.scale, self.checks = None, []
         self.count_var.set(0)
         self.detect(quiet=True)
@@ -501,7 +525,7 @@ class App(tk.Tk):
         if self.closed is None:
             return
         keep = {}
-        found = detect_pads(self.closed, self.crop_dpi, self.seed, self.count_var.get())
+        found = detect_pads(self.closed, self.crop_dpi, self.seed, self.count_var.get(), img=self.crop_img)
         for p in found:  # keep pin numbers for pads that did not move
             for q in self.pads:
                 if abs(p["cx"] - q["cx"]) < self.seed[2] and abs(p["cy"] - q["cy"]) < self.seed[3]:
