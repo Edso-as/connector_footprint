@@ -62,24 +62,26 @@ def hatch_ratio(img, b):
     return float(mag[diag].sum() / (mag.sum() + 1e-6))
 
 
-def pad_candidates(closed, dpi, img):
+def pad_candidates(closed, dpi, img, relaxed=False):
+    """Hatched oval pad outlines. relaxed=True also accepts hollow ovals (low fill) with weaker hatching."""
     lo, hi = 0.04 * dpi, 0.5 * dpi
+    fmin, hmin = (0.25, 0.30) if relaxed else (0.6, 0.35)
     cnts, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     out = []
     for c in cnts:
         x, y, w, h = cv2.boundingRect(c)
         if not (lo < w < hi and lo * 1.3 < h < hi * 2 and 0.4 < w / h < 0.85):
             continue
-        if 0.6 < cv2.contourArea(c) / (w * h) < 0.95 and hatch_ratio(img, (x, y, w, h)) > 0.35:
+        if fmin < cv2.contourArea(c) / (w * h) < 0.95 and hatch_ratio(img, (x, y, w, h)) > hmin:
             out.append((x, y, w, h))
     return out
 
 
-def group_similar(boxes):
+def group_similar(boxes, tol=0.15):
     groups = []
     for b in boxes:
         for g in groups:
-            if abs(b[2] - g[0][2]) <= 0.15 * g[0][2] and abs(b[3] - g[0][3]) <= 0.15 * g[0][3]:
+            if abs(b[2] - g[0][2]) <= tol * g[0][2] and abs(b[3] - g[0][3]) <= tol * g[0][3]:
                 g.append(b)
                 break
         else:
@@ -87,10 +89,28 @@ def group_similar(boxes):
     return groups
 
 
+def best_cluster(cands):
+    """Most column-aligned compact cluster of >=3 distinct similar candidates (text/knurls rarely align)."""
+    best, best_score = None, 0
+    for g in group_similar(cands):
+        for seed in g:
+            nb = [c for c in g if abs(c[0] - seed[0]) < 100 and abs(c[1] - seed[1]) < 100]
+            distinct = []  # fragments of one pad count once
+            for c in nb:
+                if not any(abs(c[0] - d[0]) < 8 and abs(c[1] - d[1]) < 8 for d in distinct):
+                    distinct.append(c)
+            aligned = sum(1 for d in distinct if any(e is not d and abs(e[0] - d[0]) < 8 for e in distinct))
+            score = aligned + 0.01 * len(distinct)
+            if len(distinct) >= 3 and aligned >= 2 and score > best_score:
+                best, best_score = nb, score
+    return best
+
+
 def find_region(page):
-    """Region (PDF points) around the largest compact group of similar hatched oval pads."""
+    """Region (PDF points) around the best compact group of similar oval pads (strict, then relaxed)."""
     dpi, k = 1200, 72 / 1200
-    cands, tw, th, ov = [], 200, 150, 25
+    tw, th, ov = 200, 150, 25
+    cands = {False: [], True: []}
     y = page.rect.y0
     while y < page.rect.y1:
         x = page.rect.x0
@@ -98,25 +118,21 @@ def find_region(page):
             clip = pymupdf.Rect(x, y, x + tw, y + th) & page.rect
             pix = page.get_pixmap(dpi=dpi, clip=clip)
             img = np.frombuffer(pix.samples, np.uint8).reshape(pix.h, pix.w, pix.n)[:, :, :3]
-            for bx, by, bw, bh in pad_candidates(preprocess(img, dpi), dpi, img):
-                c = (clip.x0 + (bx + bw / 2) * k, clip.y0 + (by + bh / 2) * k, bw * k, bh * k)
-                if not any(abs(c[0] - o[0]) < 2 and abs(c[1] - o[1]) < 2 for o in cands):
-                    cands.append(c)
+            closed = preprocess(img, dpi)
+            for relaxed in (False, True):
+                for bx, by, bw, bh in pad_candidates(closed, dpi, img, relaxed):
+                    c = (clip.x0 + (bx + bw / 2) * k, clip.y0 + (by + bh / 2) * k, bw * k, bh * k)
+                    if not any(abs(c[0] - o[0]) < 2 and abs(c[1] - o[1]) < 2 for o in cands[relaxed]):
+                        cands[relaxed].append(c)
             x += tw - ov
         y += th - ov
-    best = None
-    for g in group_similar(cands):
-        mx, my = np.median([c[0] for c in g]), np.median([c[1] for c in g])
-        near = [c for c in g if abs(c[0] - mx) < 60 and abs(c[1] - my) < 60]
-        if len(near) >= 3 and (best is None or len(near) > len(best)):
-            best = near
+    best = best_cluster(cands[True])
     if not best:
         return None
     x0, y0 = min(c[0] - c[2] / 2 for c in best), min(c[1] - c[3] / 2 for c in best)
     x1, y1 = max(c[0] + c[2] / 2 for c in best), max(c[1] + c[3] / 2 for c in best)
     m = 0.9 * max(x1 - x0, y1 - y0) + 20
     return pymupdf.Rect(x0 - m, y0 - m * 0.6, x1 + m, y1 + m * 0.9) & page.rect
-
 
 def refine(closed, dpi, cx, cy, w, h):
     hh, hw = int(h * 0.66), int(w * 0.9)
@@ -135,7 +151,7 @@ def refine(closed, dpi, cx, cy, w, h):
 def detect(page, rect, out_dir):
     img, dpi = render_crop(page, rect)
     closed = preprocess(img, dpi)
-    groups = group_similar(pad_candidates(closed, dpi, img))
+    groups = group_similar(pad_candidates(closed, dpi, img) or pad_candidates(closed, dpi, img, True))
     if not groups:
         sys.exit("No hatched oval pads found in the region. Use a tighter region or measure manually.")
     g = max(groups, key=len)
@@ -148,9 +164,14 @@ def detect(page, rect, out_dir):
             break
         cx = loc[0] + w / 2
         cy, rw, rh = refine(closed, dpi, cx, loc[1] + h / 2, w, h)
-        found.append(dict(cx=float(cx), cy=float(cy), w=float(rw), h=float(rh), score=round(float(mx), 2)))
         cv2.rectangle(score, (loc[0] - w, loc[1] - h), (loc[0] + w, loc[1] + h), -1, -1)
+        if hatch_ratio(img, (loc[0], loc[1], w, h)) < 0.30:  # weak matches on plain lines/arrows
+            continue
+        found.append(dict(cx=float(cx), cy=float(cy), w=float(rw), h=float(rh), score=round(float(mx), 2)))
     mw = float(np.median([p["w"] for p in found]))
+    # weak matches (score<0.7) must line up in a column with a strong one; otherwise they are dimension ticks/arrows
+    found = [p for p in found if p["score"] >= 0.7 or any(
+        q["score"] >= 0.7 and abs(q["cx"] - p["cx"]) < 0.25 * w for q in found)]
     for p in found:
         p["w"] = mw
     found.sort(key=lambda p: (round(p["cx"] / (w * 2)), p["cy"]))  # column, then top->bottom

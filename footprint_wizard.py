@@ -65,12 +65,13 @@ def pad_candidates(closed, dpi, img):
         x, y, w, h = cv2.boundingRect(c)
         if not (lo < w < hi and lo * 1.3 < h < hi * 2 and 0.4 < w / h < 0.85):
             continue
-        if 0.6 < cv2.contourArea(c) / (w * h) < 0.95 and hatch_ratio(img, (x, y, w, h)) > 0.35:
+        if 0.25 < cv2.contourArea(c) / (w * h) < 0.95 and hatch_ratio(img, (x, y, w, h)) > 0.30:
             out.append((x, y, w, h))
     return out
 
 
-def best_group(cands):
+def best_group(cands, min_n=3):
+    """Most column-aligned cluster of >=3 distinct similar candidates (text/knurls rarely align)."""
     groups = []
     for b in cands:
         for g in groups:
@@ -79,7 +80,19 @@ def best_group(cands):
                 break
         else:
             groups.append([b])
-    return max(groups, key=len) if groups else None
+    best, best_score = None, 0
+    for g in groups:
+        for seed in g:
+            nb = [c for c in g if abs(c[0] - seed[0]) < 100 and abs(c[1] - seed[1]) < 100]
+            distinct = []  # fragments of one pad count once
+            for c in nb:
+                if not any(abs(c[0] - d[0]) < 8 and abs(c[1] - d[1]) < 8 for d in distinct):
+                    distinct.append(c)
+            aligned = sum(1 for d in distinct if any(e is not d and abs(e[0] - d[0]) < 8 for e in distinct))
+            score = aligned + 0.01 * len(distinct)
+            if len(distinct) >= min_n and aligned >= min_n - 1 and score > best_score:
+                best, best_score = nb, score
+    return best
 
 
 def auto_find_layout(page):
@@ -106,21 +119,7 @@ def auto_find_layout(page):
                     cands.append(c)
             x += tw - ov
         y += th - ov
-    groups = []
-    for c in cands:
-        for g in groups:
-            if abs(c[2] - g[0][2]) <= 0.15 * g[0][2] and abs(c[3] - g[0][3]) <= 0.15 * g[0][3]:
-                g.append(c)
-                break
-        else:
-            groups.append([c])
-    # real pad groups are spatially compact; drop outliers far from the group median
-    best = None
-    for g in groups:
-        mx, my = np.median([c[0] for c in g]), np.median([c[1] for c in g])
-        near = [c for c in g if abs(c[0] - mx) < 60 and abs(c[1] - my) < 60]
-        if len(near) >= 3 and (best is None or len(near) > len(best)):
-            best = near
+    best = best_group(cands)
     if not best:
         return None
     x0, y0 = min(c[0] - c[2] / 2 for c in best), min(c[1] - c[3] / 2 for c in best)
@@ -157,11 +156,26 @@ def detect_pads(closed, dpi, seed, count=0, min_score=0.5):
         cy, rw, rh = refine(closed, dpi, cx, loc[1] + h / 2, w, h)
         found.append(dict(cx=cx, cy=cy, w=rw, h=rh, score=float(mx), pin=None))
         cv2.rectangle(score, (loc[0] - w, loc[1] - h), (loc[0] + w, loc[1] + h), -1, -1)
+    # weak matches (score<0.7) must line up in a column with a strong one; otherwise they are dimension ticks/arrows
+    found = [p for p in found if p["score"] >= 0.7 or any(
+        q["score"] >= 0.7 and abs(q["cx"] - p["cx"]) < 0.25 * w for q in found)]
     if found:
         mw = float(np.median([p["w"] for p in found]))
         for p in found:
             p["w"] = mw
     return found
+
+
+def pick_seed(closed, dpi, cands, group):
+    """Template seed = the candidate whose template matches the most pads (robust to touched/truncated pads)."""
+    pool = list(group) + [c for c in cands if c not in group]
+    best, best_key = pool[0], (-1, 0)
+    for b in pool[:12]:
+        f = detect_pads(closed, dpi, b)
+        key = (len(f), min((p["score"] for p in f), default=0))
+        if key > best_key:
+            best, best_key = b, key
+    return best
 
 
 def snap(v):
@@ -468,15 +482,14 @@ class App(tk.Tk):
         try:
             self.crop_img, self.crop_dpi = render_crop(self.page, self.region)
             self.closed = preprocess(self.crop_img, self.crop_dpi)
-            g = best_group(pad_candidates(self.closed, self.crop_dpi, self.crop_img))
+            cands = pad_candidates(self.closed, self.crop_dpi, self.crop_img)
+            g = best_group(cands) or best_group(cands, 1) or (cands[:1] or None)
         finally:
             self.config(cursor="")
         if not g:
             self.msg.set("這個區域找不到焊盤,請重新框選。")
             return False
-        self.seed = max(g, key=lambda b: cv2.contourArea(
-            cv2.findContours(self.closed[b[1]:b[1] + b[3], b[0]:b[0] + b[2]],
-                             cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0][0]) / (b[2] * b[3]))
+        self.seed = pick_seed(self.closed, self.crop_dpi, cands, g)
         self.scale, self.checks = None, []
         self.count_var.set(0)
         self.detect(quiet=True)

@@ -52,7 +52,7 @@ python .github\skills\pdf-to-footprint\scripts\measure.py build out\spec.json --
 ## 限制
 
 - 只輸出焊盤與一個依焊盤外緣加 0.25 mm 的 courtyard 框。本體外框、絲印、pin 1 標記、定位柱 (NPTH)、PCB 缺口都不會產生。
-- 自動找區域與偵測焊盤依賴「有斜線陰影的橢圓焊盤」。實心 SMD 焊盤等其他畫法可能找不到，需要手動框選。
+- 自動找區域與偵測焊盤依賴「有斜線陰影的橢圓焊盤」(實心或空心外框皆可)。自動找區域可能選錯，請手動框選；實心 SMD 焊盤等其他畫法可能找不到。
 - 沒有 OCR：標註數字（距離、焊盤與鑽孔尺寸）由使用者或 LLM 讀圖後輸入。
 - 驗證容許誤差為 0.1 mm，請和圖面公差（例如 ±0.05）比較。
 - 輸出檔未在 KiCad 內開啟驗證，請用 Footprint Editor 開啟並和 PDF 對照。
