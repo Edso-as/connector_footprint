@@ -2,13 +2,14 @@
 
 從連接器規格書 PDF 的「建議焊盤圖 (Recommended PCB layout)」量測焊盤位置，產生 KiCad `.kicad_mod` 與 `.csv`，並用圖上標註的尺寸驗證結果。
 
-> 目前只在一份規格書（`DA2-4164R-60BMX-U.pdf`，3.5 mm 音源插座）上測試過。其他連接器請先試跑並自行核對。
+> 已在三份 3.5 mm 音源插座規格書（DA2-4164R、A1241-0001、2SJ3080）上測過焊盤偵測。其他連接器請先試跑並自行核對。
 
 ## 內容
 
 | 檔案 | 用途 |
 |---|---|
 | `footprint_wizard.py` | 圖形介面（六步驟精靈） |
+| `build_exe.bat` | 打包成單一 `PDF2Footprint.exe` |
 | `.github/skills/pdf-to-footprint/` | Copilot skill：由 LLM 讀圖，腳本量測並驗證 |
 | `.github/skills/pdf-to-footprint/scripts/measure.py` | 命令列量測與建置腳本（skill 使用） |
 | `extract.py` | 早期的單檔範例腳本，只對示範 PDF 有效 |
@@ -28,6 +29,10 @@ GUI 使用 Python 內建的 Tkinter，不需另外安裝。
 
 ## 快速開始
 
+**使用 exe（執行時免裝 Python）**
+
+雙擊 `build_exe.bat` 打包，產生 `dist\PDF2Footprint.exe`（約 90 MB，首次啟動約 10 秒）。打包需要 Python，會自動安裝 PyInstaller 與相依套件。
+
 **圖形介面**
 ```
 python footprint_wizard.py
@@ -43,6 +48,15 @@ python .github\skills\pdf-to-footprint\scripts\measure.py build out\spec.json --
 **Copilot skill**：在此資料夾開啟對話，說「幫我把這份 PDF 的建議焊盤圖做成 KiCad footprint」，或輸入 `/pdf-to-footprint`。
 
 詳細步驟請見 [docs/使用手冊.md](docs/使用手冊.md)。
+
+## 基本流程（GUI）
+
+1. 開啟 PDF，選對頁碼（多頁規格書的圖不一定在第 1 頁）。
+2. 框選「建議焊盤圖」區域；自動找錯時，直接在圖上拖曳框選。
+3. 確認偵測到的焊盤數量。
+4. 點選焊盤，標示 Pin 編號。
+5. 點兩個已知距離的焊盤，輸入距離以校準比例。
+6. 查看尺寸驗證結果（✔/✘），通過後匯出。
 
 ## 輸出
 
